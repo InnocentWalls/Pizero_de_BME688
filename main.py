@@ -1,205 +1,178 @@
-import time
-import colorsys
-import os
-import sys
-import socket
-import ST7735
-import datetime
+#!/usr/bin/env python3
+"""
+Enviro+ ＆ PMS5003 を InfluxDB 2.x へ送信
+* CPU 温度補正（CPU温度を平滑化）
+* BME280読み取りを中央値化 + 外れ値/急変を除外（温度/湿度のスパイク対策）
+* MEMS マイク (ICS-43434) で dBA 推定
+* バッチ＋自動再試行で Wi-Fi 切断に強い
+"""
 
-try:
-    # Transitional fix for breaking change in LTR559
-    from ltr559 import LTR559
-    ltr559 = LTR559()
-except ImportError:
-    import ltr559
+from time import sleep
+import math
+import statistics
+from collections import deque
 
-
-#fvalent
-from pms5003 import PMS5003
-
-from bme280 import BME280
 from enviroplus import gas
-from subprocess import PIPE, Popen
-from PIL import Image
-from PIL import ImageDraw
-from PIL import ImageFont
+from enviroplus.noise import Noise
+from pms5003 import PMS5003
+from bme280 import BME280
+from ltr559 import LTR559
 
-from influxdb import InfluxDBClient
+from influxdb_client import InfluxDBClient, Point
+from influxdb_client.client.write_api import WriteOptions
 
-try:
-    from smbus2 import SMBus
-except ImportError:
-    from smbus import SMBus
+# ── InfluxDB 接続設定 ──
+INFLUX_URL    = "http://192.168.100.7:8086"
+INFLUX_TOKEN  = "your-superlong-token-here"
+INFLUX_ORG    = "your-org-name"
+INFLUX_BUCKET = "urban"
+HOST_TAG      = "pi-living"
 
-print("""
+# ── 計測周期 ──
+INTERVAL_SEC = 300  # 5分
 
-Press Ctrl+C to exit!
+# ── CPU 温度補正 ──
+def get_cpu_temp() -> float:
+    with open("/sys/class/thermal/thermal_zone0/temp") as f:
+        return int(f.read()) / 1000.0  # °C
 
-""")
+_cpu_hist = deque(maxlen=12)  # 直近12回(= 1時間ぶん/5分周期)から平均。必要なら短くしてOK
 
-# BME280 temperature/pressure/humidity sensor
-bus = SMBus(1)
-bme280 = BME280(i2c_dev=bus)
+def compensate_temp(raw: float, factor: float = 5.0) -> float:
+    cpu = get_cpu_temp()
+    _cpu_hist.append(cpu)
+    cpu_avg = sum(_cpu_hist) / len(_cpu_hist)
+    return raw - (cpu_avg - raw) / factor
 
-#fvalent
-pms5003 = PMS5003()
+# ── センサー読み取り安定化 ──
+def median_read(fn, n=5, sleep_s=0.05):
+    """n回読んで中央値を返す（単発の変値を潰す）。全滅ならNone。"""
+    vals = []
+    for _ in range(n):
+        try:
+            v = fn()
+            if v is not None and not (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+                vals.append(v)
+        except Exception:
+            pass
+        sleep(sleep_s)
+    return statistics.median(vals) if vals else None
 
-# Create ST7735 LCD display class
-st7735 = ST7735.ST7735(
-    port=0,
-    cs=1,
-    dc=9,
-    backlight=12,
-    rotation=270,
-    spi_speed_hz=10000000
-)
+_last_good = {}
 
-# Initialize display
-st7735.begin()
+def sanitize(name, new, *, min_v=None, max_v=None, max_step=None):
+    """
+    - 範囲外は捨てる
+    - 前回からの変化が大きすぎたら捨てる（スパイク対策）
+    - None/NaN/Infも捨てる
+    """
+    old = _last_good.get(name)
 
-WIDTH = st7735.width
-HEIGHT = st7735.height
+    if new is None:
+        return old
+    if isinstance(new, float) and (math.isnan(new) or math.isinf(new)):
+        return old
 
-# Set up canvas and font
-# img = Image.new('RGB', (WIDTH, HEIGHT), color=(0, 0, 0))
-# draw = ImageDraw.Draw(img)
-# path = os.path.dirname(os.path.realpath(__file__))
-# font = ImageFont.truetype(path + "/fonts/Asap/Asap-Bold.ttf", 20)
+    if min_v is not None and new < min_v:
+        return old
+    if max_v is not None and new > max_v:
+        return old
 
-# Set up InfluxDB
-influx = InfluxDBClient(host="192.168.100.7",
-                        port="8086",
-                        username="grafana",
-                        password="grafana",
-                        database="urban")
+    if old is not None and max_step is not None and abs(new - old) > max_step:
+        return old
 
+    _last_good[name] = new
+    return new
 
-influx_json_prototyp = [
-        {
-            "measurement": "enviroplus",
-            "tags": {
-                "host": "enviroplus"
-            },
-            "fields": {
-            }
-        }
-    ]
+# ── 初期化 ──
+client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
 
-# The position of the top bar
-top_pos = 25
+write_api = client.write_api(write_options=WriteOptions(
+    batch_size=500,
+    flush_interval=10_000,
+    jitter_interval=2_000,
+    retry_interval=5_000,
+    max_retries=5,
+    max_retry_delay=30_000,
+    exponential_base=2
+))
 
+pms   = PMS5003()
+bme   = BME280()
+ltr   = LTR559()
+noise = Noise()
 
+# ── ループ ──
+while True:
+    # --- BME280：複数回読んで中央値 ---
+    raw_temp = median_read(bme.get_temperature, n=5)
+    hum      = median_read(bme.get_humidity,    n=5)
+    pres     = median_read(bme.get_pressure,    n=5)
 
+    # CPU補正（rawが取れた時だけ）
+    temp = None
+    if raw_temp is not None:
+        temp = compensate_temp(raw_temp, factor=5.0)
 
+    # --- スパイク抑制（5分周期想定の変化量制限） ---
+    # 温度：5分で±1.5℃以上は基本スパイク扱い（室内想定。屋外なら2.5とかに上げる）
+    temp = sanitize("temperature", temp, min_v=-20, max_v=60, max_step=1.5)
 
-# Get the temperature of the CPU for compensation
-def get_cpu_temperature():
-    process = Popen(['vcgencmd', 'measure_temp'], stdout=PIPE)
-    output, _error = process.communicate()
-    output = output.decode()
-    return float(output[output.index('=') + 1:output.rindex("'")])
+    # 湿度：5分で±8%RH以上は基本スパイク扱い（加湿器直撃とかなら上げる）
+    hum  = sanitize("humidity", hum,  min_v=0, max_v=100, max_step=8.0)
 
-# Get local IP address
-def get_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # 気圧：5分で±3hPa以上は基本スパイク扱い
+    pres = sanitize("pressure", pres, min_v=800, max_v=1100, max_step=3.0)
+
+    # --- ほかのセンサー ---
     try:
-        # doesn't even have to be reachable
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
-
-
-# Tuning factor for compensation. Decrease this number to adjust the
-# temperature down, and increase to adjust up
-factor = 0.8
-
-cpu_temps = [0] * 5
-
-delay = 0.5  # Debounce the proximity tap
-mode = 0  # The starting mode
-last_page = 0
-light = 1
-
-
-
-
-
-
-# Create a values dict to store the data
-variables = ["temperature",
-             "pressure",
-             "humidity",
-             "light",
-             "oxidised",
-             "reduced",
-             "nh3",
-             "pm010",
-             "pm025",
-             "pm100"]
-
-values = {}
-
-for v in variables:
-    values[v] = [1] * WIDTH
-
-# The main loop
-try:
-    iterations = 0
-    while True:
-        current_time = datetime.datetime.utcnow().isoformat() + "Z"
-        proximity = ltr559.get_proximity()
-
-        # Compensated Temperature
-        cpu_temp = get_cpu_temperature()
-        # Smooth out with some averaging to decrease jitter
-        cpu_temps = cpu_temps[1:] + [cpu_temp]
-        avg_cpu_temp = sum(cpu_temps) / float(len(cpu_temps))
-        raw_temp = bme280.get_temperature()
-        compensated_temp = raw_temp - ((avg_cpu_temp - raw_temp) / factor)
-
-        # Change json
-        influx_json_prototyp[0]['fields']['ltr559.proximity'] = proximity
-
-        if proximity < 10:
-            influx_json_prototyp[0]['fields']['ltr559.lux'] = ltr559.get_lux()
-        else:
-            influx_json_prototyp[0]['fields']['ltr559.lux'] = 1.0
-
-        if iterations >= 6:
-            influx_json_prototyp[0]['fields']['bme280.temperature.raw'] = bme280.get_temperature()
-            influx_json_prototyp[0]['fields']['bme280.temperature.compensated'] = compensated_temp
-
-        influx_json_prototyp[0]['fields']['cpu.temperature'] = get_cpu_temperature()
-        influx_json_prototyp[0]['fields']['bme280.pressure'] = bme280.get_pressure()
-        influx_json_prototyp[0]['fields']['bme280.humidity'] = bme280.get_humidity()
-
         gas_data = gas.read_all()
-        influx_json_prototyp[0]['fields']['mics6814.oxidising'] = gas_data.oxidising
-        influx_json_prototyp[0]['fields']['mics6814.reducing'] = gas_data.reducing
-        influx_json_prototyp[0]['fields']['mics6814.nh3'] = gas_data.nh3
+    except Exception:
+        gas_data = None
 
-        #fvalent
-        data = pms5003.read()
-        influx_json_prototyp[0]['fields']['pms5003.pm010'] = data.pm_ug_per_m3(1.0)
-        influx_json_prototyp[0]['fields']['pms5003.pm025'] = data.pm_ug_per_m3(2.5)
-        influx_json_prototyp[0]['fields']['pms5003.pm100'] = data.pm_ug_per_m3(10)
+    try:
+        pm = pms.read()
+    except Exception:
+        pm = None
 
-        influx_json_prototyp[0]['time'] = current_time  # ??????????
+    try:
+        lux = float(ltr.get_lux())
+    except Exception:
+        lux = None
+    lux = sanitize("lux", lux, min_v=0, max_v=200000, max_step=100000)
 
+    try:
+        noise_dba = round(noise.get_noise_profile()[3], 1)
+    except Exception:
+        noise_dba = None
 
-        if iterations >= 3:
-            print("Write points: {0}".format(influx_json_prototyp))
-            influx.write_points(influx_json_prototyp, time_precision='ms')
-        else:
-            print("Skip iteration: " + str(iterations))
+    # --- Influx Point 作成（値がNoneのものは送らない） ---
+    points = []
 
-        time.sleep(60)
-        iterations += 1
+    if temp is not None:
+        points.append(Point("temperature").tag("device", HOST_TAG).field("value", round(temp, 2)))
+    if hum is not None:
+        points.append(Point("humidity").tag("device", HOST_TAG).field("value", round(hum, 2)))
+    if pres is not None:
+        points.append(Point("pressure").tag("device", HOST_TAG).field("value", round(pres, 2)))
 
-# Exit cleanly
-except KeyboardInterrupt:
-    sys.exit(0)
+    if pm is not None:
+        points.append(Point("pm1").tag("device", HOST_TAG).field("value", float(pm.pm_ug_per_m3(1.0))))
+        points.append(Point("pm2_5").tag("device", HOST_TAG).field("value", float(pm.pm_ug_per_m3(2.5))))
+        points.append(Point("pm10").tag("device", HOST_TAG).field("value", float(pm.pm_ug_per_m3(10))))
+
+    if gas_data is not None:
+        points.append(Point("oxidising").tag("device", HOST_TAG).field("value", float(gas_data.oxidising)))
+        points.append(Point("reducing").tag("device", HOST_TAG).field("value", float(gas_data.reducing)))
+        points.append(Point("nh3").tag("device", HOST_TAG).field("value", float(gas_data.nh3)))
+
+    if lux is not None:
+        points.append(Point("lux").tag("device", HOST_TAG).field("value", float(lux)))
+
+    if noise_dba is not None:
+        points.append(Point("noise_dba").tag("device", HOST_TAG).field("value", float(noise_dba)))
+
+    if points:
+        write_api.write(bucket=INFLUX_BUCKET, org=INFLUX_ORG, record=points)
+
+    sleep(INTERVAL_SEC)
