@@ -1,85 +1,176 @@
 #!/usr/bin/env python3
 """
-Enviro+ ＆ PMS5003 を InfluxDB 1.x へ送信
-* CPU 温度補正（CPU温度を平滑化）
-* BME280読み取りを中央値化 + 外れ値/急変を除外（温度/湿度のスパイク対策）
-* MEMS マイク (ICS-43434) で dBA 推定
-* WiFi切断やネットワークエラーに強い堅牢な実装
-* 1分間隔の厳密なロギング
-* 送信失敗データの自動保存と復旧時の再送信
+Raspberry Pi Zero W + Enviro+ センサーロガー
+InfluxDBへの堅牢なデータ送信を実装
+WiFi切断やネットワークエラーに対応し、1分間隔のロギングを厳密に保つ
 """
 
 import time
+from time import sleep
 import math
 import statistics
 import logging
+import sys
 import socket
 import traceback
-import json
-import os
 from collections import deque
 from datetime import datetime
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any, Tuple
 
-from enviroplus import gas
-from enviroplus.noise import Noise
-from pms5003 import PMS5003
-from bme280 import BME280
-from ltr559 import LTR559
+try:
+    # Pimoroni公式enviroplusライブラリのインポート
+    from enviroplus import gas
+    from enviroplus.noise import Noise
+    # センサーライブラリ（enviroplusパッケージ内に統合されている場合と別パッケージの場合がある）
+    try:
+        # まずenviroplusパッケージ内からインポートを試みる（公式推奨）
+        from enviroplus import BME280
+        from enviroplus import LTR559
+        from enviroplus import PMS5003
+    except ImportError:
+        # 別パッケージとして提供されている場合のフォールバック
+        from bme280 import BME280
+        from ltr559 import LTR559
+        from pms5003 import PMS5003
+except ImportError as e:
+    print(f"警告: Enviro+ライブラリのインポートに失敗しました: {e}")
+    print("必要なパッケージをインストールしてください:")
+    print("  pip install enviroplus")
+    print("または、Pimoroniの公式インストールスクリプトを使用:")
+    print("  curl https://get.pimoroni.com/enviroplus | bash")
+    print("別パッケージが必要な場合:")
+    print("  pip install bme280 pms5003 ltr559")
+    sys.exit(1)
 
-from influxdb import InfluxDBClient
+try:
+    from influxdb import InfluxDBClient
+except ImportError:
+    print("警告: InfluxDBクライアントのインポートに失敗しました")
+    print("インストール方法: pip install influxdb")
+    sys.exit(1)
 
-# ── InfluxDB 接続設定（環境変数から読み込み） ──
+# =============================
+# 設定
+# =============================
 INFLUX_CONFIG = {
-    "host": os.getenv("INFLUXDB_HOST", "localhost"),
-    "port": int(os.getenv("INFLUXDB_PORT", "8086")),
-    "username": os.getenv("INFLUXDB_USERNAME", ""),
-    "password": os.getenv("INFLUXDB_PASSWORD", ""),
-    "database": os.getenv("INFLUXDB_DATABASE", "sensors")
+    "host": "192.168.100.7",
+    "port": 8086,
+    "username": "grafana",
+    "password": "grafana",
+    "database": "urban"
 }
-HOST_TAG = os.getenv("HOST_TAG", "raspberry-pi")
 
-# ── 計測周期 ──
-INTERVAL_SEC = int(os.getenv("LOG_INTERVAL_SEC", "60"))  # デフォルト1分
+LOG_INTERVAL = 60  # 1分間隔（秒）- 厳密に保つ
+MAX_RETRIES = 3  # 最大リトライ回数（短縮して次のサイクルに影響させない）
+RETRY_DELAY = 2  # リトライ間隔（秒）- 短縮
+CONNECTION_TIMEOUT = 5  # 接続タイムアウト（秒）- 短縮
+NETWORK_CHECK_TIMEOUT = 2  # ネットワーク確認タイムアウト（秒）
 
-# ── ネットワーク設定 ──
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))  # 最大リトライ回数
-RETRY_DELAY = int(os.getenv("RETRY_DELAY_SEC", "2"))  # リトライ間隔（秒）
-CONNECTION_TIMEOUT = int(os.getenv("CONNECTION_TIMEOUT_SEC", "5"))  # 接続タイムアウト（秒）
-NETWORK_CHECK_TIMEOUT = int(os.getenv("NETWORK_CHECK_TIMEOUT_SEC", "2"))  # ネットワーク確認タイムアウト（秒）
-
-# ── 失敗データ保存設定 ──
-FAILED_DATA_FILE = os.getenv("FAILED_DATA_FILE", "/var/log/sensor_failed_data.json")  # 失敗データ保存ファイル
-MAX_FAILED_ENTRIES = int(os.getenv("MAX_FAILED_ENTRIES", "1000"))  # 最大保存エントリ数（メモリ保護のため）
-
-# ── ログ設定 ──
-LOG_FILE = os.getenv("LOG_FILE", "/var/log/sensor_logger.log")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# ログ設定
+# /var/logへの書き込み権限がない場合、カレントディレクトリにログファイルを作成
+LOG_FILE_PATH = '/var/log/sensor_logger.log'
+try:
+    # /var/logへの書き込みを試みる
+    test_file = open(LOG_FILE_PATH, 'a')
+    test_file.close()
+except (PermissionError, OSError):
+    # 書き込み権限がない場合は、カレントディレクトリに保存
+    import os
+    LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sensor_logger.log')
+    print(f"警告: /var/logへの書き込み権限がありません。ログファイルを {LOG_FILE_PATH} に保存します。")
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
-        logging.StreamHandler()
+        logging.FileHandler(LOG_FILE_PATH),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger(__name__)
 
-# ── CPU 温度補正 ──
-def get_cpu_temp() -> float:
-    with open("/sys/class/thermal/thermal_zone0/temp") as f:
-        return int(f.read()) / 1000.0  # °C
 
-_cpu_hist = deque(maxlen=60)  # 直近60回(= 1時間ぶん/1分周期)から平均
+# =============================
+# ユーティリティ関数
+# =============================
+def check_internet_connection(host: str = "8.8.8.8", port: int = 53, timeout: int = None) -> bool:
+    """
+    インターネット接続を確認
+    """
+    if timeout is None:
+        timeout = NETWORK_CHECK_TIMEOUT
+    try:
+        socket.setdefaulttimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
 
-def compensate_temp(raw: float, factor: float = 5.0) -> float:
-    cpu = get_cpu_temp()
-    _cpu_hist.append(cpu)
-    cpu_avg = sum(_cpu_hist) / len(_cpu_hist)
-    return raw - (cpu_avg - raw) / factor
 
-# ── センサー読み取り安定化 ──
+def check_influxdb_reachable(host: str, port: int, timeout: int = None) -> bool:
+    """
+    InfluxDBサーバーへのネットワーク接続を確認
+    """
+    if timeout is None:
+        timeout = NETWORK_CHECK_TIMEOUT
+    try:
+        socket.setdefaulttimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def check_influxdb_connection(client: InfluxDBClient) -> bool:
+    """
+    InfluxDBへの接続を確認
+    """
+    try:
+        # ping()はタイムアウトが長い場合があるため、接続確認のみ
+        # 実際の送信時にエラーが発生した場合は、その時点で再接続する
+        return client is not None
+    except Exception as e:
+        logger.debug(f"InfluxDB接続確認失敗: {e}")
+        return False
+
+
+def create_influxdb_client() -> Optional[InfluxDBClient]:
+    """
+    InfluxDBクライアントを作成
+    """
+    try:
+        # まずネットワーク接続を確認
+        if not check_influxdb_reachable(INFLUX_CONFIG["host"], INFLUX_CONFIG["port"]):
+            logger.debug(f"InfluxDBサーバー {INFLUX_CONFIG['host']}:{INFLUX_CONFIG['port']} に到達できません")
+            return None
+        
+        client = InfluxDBClient(
+            host=INFLUX_CONFIG["host"],
+            port=INFLUX_CONFIG["port"],
+            username=INFLUX_CONFIG["username"],
+            password=INFLUX_CONFIG["password"],
+            database=INFLUX_CONFIG["database"],
+            timeout=CONNECTION_TIMEOUT
+        )
+        logger.info("InfluxDBクライアント作成成功")
+        return client
+    except Exception as e:
+        logger.debug(f"InfluxDBクライアント作成エラー: {e}")
+        return None
+
+
+# センサーインスタンス（グローバル変数として一度だけ初期化）
+_sensor_bme280 = None
+_sensor_ltr559 = None
+_sensor_pms5003 = None
+
+# センサー読み取り安定化用の関数
 def median_read(fn, n=5, sleep_s=0.05):
     """n回読んで中央値を返す（単発の変値を潰す）。全滅ならNone。"""
     vals = []
@@ -90,7 +181,7 @@ def median_read(fn, n=5, sleep_s=0.05):
                 vals.append(v)
         except Exception:
             pass
-        time.sleep(sleep_s)
+        sleep(sleep_s)
     return statistics.median(vals) if vals else None
 
 _last_good = {}
@@ -119,53 +210,211 @@ def sanitize(name, new, *, min_v=None, max_v=None, max_step=None):
     _last_good[name] = new
     return new
 
-# ── ネットワーク確認関数 ──
-def check_influxdb_reachable(host: str, port: int, timeout: int = None) -> bool:
-    """InfluxDBサーバーへのネットワーク接続を確認"""
-    if timeout is None:
-        timeout = NETWORK_CHECK_TIMEOUT
+def init_sensors():
+    """センサーを初期化（一度だけ実行）"""
+    global _sensor_bme280, _sensor_ltr559, _sensor_pms5003
     try:
-        socket.setdefaulttimeout(timeout)
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0
-    except Exception:
-        return False
-
-def create_influxdb_client() -> Optional[InfluxDBClient]:
-    """InfluxDBクライアントを作成"""
-    try:
-        if not check_influxdb_reachable(INFLUX_CONFIG["host"], INFLUX_CONFIG["port"]):
-            logger.debug(f"InfluxDBサーバー {INFLUX_CONFIG['host']}:{INFLUX_CONFIG['port']} に到達できません")
-            return None
-        
-        client = InfluxDBClient(
-            host=INFLUX_CONFIG["host"],
-            port=INFLUX_CONFIG["port"],
-            username=INFLUX_CONFIG["username"],
-            password=INFLUX_CONFIG["password"],
-            database=INFLUX_CONFIG["database"],
-            timeout=CONNECTION_TIMEOUT
-        )
-        logger.debug("InfluxDBクライアント作成成功")
-        return client
+        if _sensor_bme280 is None:
+            _sensor_bme280 = BME280()
+            logger.info("BME280センサー初期化成功")
+            # 初期化直後に数回読み取って安定化
+            for _ in range(3):
+                try:
+                    _sensor_bme280.get_temperature()
+                    _sensor_bme280.get_humidity()
+                    _sensor_bme280.get_pressure()
+                    sleep(0.1)
+                except Exception:
+                    pass
+        if _sensor_ltr559 is None:
+            _sensor_ltr559 = LTR559()
+            logger.info("LTR559センサー初期化成功")
+        if _sensor_pms5003 is None:
+            try:
+                _sensor_pms5003 = PMS5003()
+                logger.info("PMS5003センサー初期化成功")
+            except Exception as e:
+                logger.debug(f"PMS5003センサー初期化スキップ: {e}")
     except Exception as e:
-        logger.debug(f"InfluxDBクライアント作成エラー: {e}")
+        logger.error(f"センサー初期化エラー: {e}")
+        raise
+
+def read_sensor_data() -> Optional[Dict[str, Any]]:
+    """
+    センサーからデータを読み取る
+    """
+    global _sensor_bme280, _sensor_ltr559, _sensor_pms5003
+    
+    try:
+        # センサーが初期化されていない場合は初期化
+        if _sensor_bme280 is None or _sensor_ltr559 is None:
+            init_sensors()
+        
+        # BME280（温度、湿度、気圧）- 中央値化で安定化
+        raw_temp = median_read(_sensor_bme280.get_temperature, n=5)
+        raw_hum = median_read(_sensor_bme280.get_humidity, n=5)
+        raw_pres = median_read(_sensor_bme280.get_pressure, n=5)
+        
+        # スパイク対策（1分周期想定の変化量制限）
+        temperature = sanitize("temperature", raw_temp, min_v=-20, max_v=60, max_step=0.5)
+        humidity = sanitize("humidity", raw_hum, min_v=0, max_v=100, max_step=3.0)
+        pressure = sanitize("pressure", raw_pres, min_v=800, max_v=1100, max_step=1.0)
+        
+        # ガスセンサー
+        gas_data = gas.read_all()
+        
+        # LTR559（光センサー）
+        lux = _sensor_ltr559.get_lux()
+        proximity = _sensor_ltr559.get_proximity()
+        
+        # ノイズセンサー
+        try:
+            noise = Noise()
+            noise_dba = round(noise.get_noise_profile()[3], 1)
+        except Exception as e:
+            logger.debug(f"ノイズセンサー読み取りスキップ: {e}")
+            noise_dba = None
+        
+        # PMS5003（粒子状物質センサー）- オプション
+        pm1 = None
+        pm25 = None
+        pm10 = None
+        if _sensor_pms5003 is not None:
+            try:
+                pm_data = _sensor_pms5003.read()
+                pm1 = pm_data.pm_ug_per_m3(1.0)
+                pm25 = pm_data.pm_ug_per_m3(2.5)
+                pm10 = pm_data.pm_ug_per_m3(10.0)
+            except Exception as e:
+                logger.debug(f"PMS5003読み取りスキップ: {e}")
+        
+        data = {
+            "temperature": round(temperature, 2),
+            "pressure": round(pressure, 2),
+            "humidity": round(humidity, 2),
+            "gas_oxidising": float(gas_data.oxidising),  # 1000で割らない
+            "gas_reducing": float(gas_data.reducing),
+            "gas_nh3": float(gas_data.nh3),
+            "lux": float(lux),
+            "proximity": proximity,
+            "noise_dba": noise_dba
+        }
+        
+        if pm1 is not None:
+            data.update({
+                "pm1": pm1,
+                "pm25": pm25,
+                "pm10": pm10
+            })
+        
+        return data
+        
+    except Exception as e:
+        logger.error(f"センサー読み取りエラー: {e}")
+        logger.error(traceback.format_exc())
         return None
 
-def send_to_influxdb(client: InfluxDBClient, points_data: list) -> bool:
-    """InfluxDBにデータを送信"""
+
+def send_to_influxdb(client: InfluxDBClient, data: Dict[str, Any]) -> bool:
+    """
+    InfluxDBにデータを送信（scd41/test.pyの形式に合わせる）
+    """
     try:
+        timestamp = datetime.utcnow().isoformat()
+        HOST_TAG = "pi-living"  # デバイスタグ
+        
         json_body = []
-        for point in points_data:
+        
+        # 温度
+        if data.get("temperature") is not None:
             json_body.append({
-                "measurement": point["measurement"],
-                "tags": point.get("tags", {}),
-                "time": point.get("time", datetime.utcnow().isoformat()),
-                "fields": point["fields"]
+                "measurement": "temperature",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": round(data.get("temperature"), 2)}
             })
+        
+        # 湿度
+        if data.get("humidity") is not None:
+            json_body.append({
+                "measurement": "humidity",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": round(data.get("humidity"), 2)}
+            })
+        
+        # 気圧
+        if data.get("pressure") is not None:
+            json_body.append({
+                "measurement": "pressure",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": round(data.get("pressure"), 2)}
+            })
+        
+        # PMS5003データ
+        if data.get("pm1") is not None:
+            json_body.append({
+                "measurement": "pm1",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": float(data.get("pm1"))}
+            })
+            json_body.append({
+                "measurement": "pm2_5",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": float(data.get("pm25"))}
+            })
+            json_body.append({
+                "measurement": "pm10",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": float(data.get("pm10"))}
+            })
+        
+        # ガスセンサー（1000で割らない、元の値のまま）
+        if data.get("gas_oxidising") is not None:
+            json_body.append({
+                "measurement": "oxidising",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": float(data.get("gas_oxidising", 0) * 1000)}  # 元の値に戻す
+            })
+            json_body.append({
+                "measurement": "reducing",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": float(data.get("gas_reducing", 0) * 1000)}
+            })
+            json_body.append({
+                "measurement": "nh3",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": float(data.get("gas_nh3", 0) * 1000)}
+            })
+        
+        # 照度
+        if data.get("lux") is not None:
+            json_body.append({
+                "measurement": "lux",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": float(data.get("lux"))}
+            })
+        
+        # ノイズ（noise_dbaがある場合）
+        if data.get("noise_dba") is not None:
+            json_body.append({
+                "measurement": "noise_dba",
+                "tags": {"device": HOST_TAG},
+                "time": timestamp,
+                "fields": {"value": round(data.get("noise_dba"), 1)}
+            })
+        
+        if not json_body:
+            logger.warning("送信するデータがありません")
+            return False
         
         result = client.write_points(json_body)
         if result:
@@ -174,7 +423,9 @@ def send_to_influxdb(client: InfluxDBClient, points_data: list) -> bool:
         else:
             logger.warning("データ送信失敗（結果がFalse）")
             return False
+            
     except Exception as e:
+        # 接続エラーの場合は、クライアントを無効化する必要がある
         error_msg = str(e).lower()
         if "connection" in error_msg or "timeout" in error_msg or "network" in error_msg:
             logger.debug(f"InfluxDB送信エラー（接続関連）: {e}")
@@ -182,8 +433,13 @@ def send_to_influxdb(client: InfluxDBClient, points_data: list) -> bool:
             logger.warning(f"InfluxDB送信エラー: {e}")
         return False
 
-def send_with_retry(client: Optional[InfluxDBClient], points_data: list, max_time: float = None) -> Tuple[bool, Optional[InfluxDBClient]]:
-    """リトライロジック付きでInfluxDBに送信"""
+
+def send_with_retry(client: Optional[InfluxDBClient], data: Dict[str, Any], max_time: float = None) -> Tuple[bool, Optional[InfluxDBClient]]:
+    """
+    リトライロジック付きでInfluxDBに送信
+    戻り値: (成功フラグ, クライアント)
+    max_timeが指定されている場合、その時間内に収める
+    """
     start_time = time.time()
     
     if client is None:
@@ -193,6 +449,7 @@ def send_with_retry(client: Optional[InfluxDBClient], points_data: list, max_tim
             return False, None
     
     for attempt in range(MAX_RETRIES):
+        # 時間制限チェック
         if max_time is not None:
             elapsed = time.time() - start_time
             if elapsed >= max_time:
@@ -200,20 +457,23 @@ def send_with_retry(client: Optional[InfluxDBClient], points_data: list, max_tim
                 return False, client
         
         try:
-            if send_to_influxdb(client, points_data):
+            # データ送信
+            if send_to_influxdb(client, data):
                 return True, client
             else:
+                # 送信失敗時はクライアントを無効化して再接続を試みる
                 client = None
                 if attempt < MAX_RETRIES - 1:
+                    # 残り時間を考慮して待機
                     if max_time is not None:
                         elapsed = time.time() - start_time
                         remaining = max_time - elapsed
                         if remaining > RETRY_DELAY:
-                            time.sleep(RETRY_DELAY)
+                            sleep(RETRY_DELAY)
                         elif remaining > 0:
-                            time.sleep(remaining)
+                            sleep(remaining)
                     else:
-                        time.sleep(RETRY_DELAY)
+                        sleep(RETRY_DELAY)
                     
                     logger.debug(f"送信失敗、再接続を試みます（試行 {attempt + 2}/{MAX_RETRIES}）")
                     client = create_influxdb_client()
@@ -222,6 +482,7 @@ def send_with_retry(client: Optional[InfluxDBClient], points_data: list, max_tim
                 else:
                     logger.debug("最大リトライ回数に達しました")
                     return False, None
+                    
         except Exception as e:
             logger.debug(f"送信試行エラー（試行 {attempt + 1}/{MAX_RETRIES}）: {e}")
             client = None
@@ -241,378 +502,118 @@ def send_with_retry(client: Optional[InfluxDBClient], points_data: list, max_tim
     
     return False, client
 
-# ── 失敗データ保存・復旧機能 ──
-def save_failed_data(points_data: list, timestamp: str) -> None:
-    """送信失敗データをファイルに保存"""
+
+def main_loop():
+    """
+    メインループ
+    1分間隔のロギングを厳密に保つ
+    """
+    logger.info("センサーロガーを開始します")
+    logger.info(f"ロギング間隔: {LOG_INTERVAL}秒")
+    logger.info(f"InfluxDB: {INFLUX_CONFIG['host']}:{INFLUX_CONFIG['port']}")
+    
+    # センサーを初期化（一度だけ）
     try:
-        failed_entry = {
-            "timestamp": timestamp,
-            "saved_at": datetime.utcnow().isoformat(),
-            "points_data": points_data
-        }
-        
-        # 既存データを読み込む
-        failed_data = load_failed_data()
-        
-        # 新しいエントリを追加
-        failed_data.append(failed_entry)
-        
-        # 最大エントリ数を超えた場合は古いものから削除
-        if len(failed_data) > MAX_FAILED_ENTRIES:
-            failed_data = failed_data[-MAX_FAILED_ENTRIES:]
-            logger.warning(f"失敗データが最大数({MAX_FAILED_ENTRIES})に達しました。古いデータを削除します。")
-        
-        # ファイルに保存
-        # ディレクトリが存在しない場合は作成
-        file_dir = os.path.dirname(FAILED_DATA_FILE)
-        if file_dir and not os.path.exists(file_dir):
-            try:
-                os.makedirs(file_dir, exist_ok=True)
-            except Exception as e:
-                logger.warning(f"ディレクトリ作成失敗: {e}。カレントディレクトリに保存します。")
-                # カレントディレクトリに保存
-                failed_file = "sensor_failed_data.json"
-        else:
-            failed_file = FAILED_DATA_FILE
-        
-        with open(failed_file, 'w', encoding='utf-8') as f:
-            json.dump(failed_data, f, ensure_ascii=False, indent=2)
-        
-        logger.info(f"失敗データを保存しました: {len(points_data)}ポイント（合計{len(failed_data)}エントリ）")
+        init_sensors()
     except Exception as e:
-        logger.error(f"失敗データの保存エラー: {e}")
+        logger.error(f"センサー初期化に失敗しました: {e}")
         logger.error(traceback.format_exc())
-
-def load_failed_data() -> List[Dict[str, Any]]:
-    """保存された失敗データを読み込む"""
-    try:
-        # まず通常のパスを試す
-        if os.path.exists(FAILED_DATA_FILE):
-            with open(FAILED_DATA_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-                else:
-                    logger.warning("失敗データファイルの形式が不正です。空のリストを返します。")
-                    return []
-        # カレントディレクトリも確認
-        elif os.path.exists("sensor_failed_data.json"):
-            with open("sensor_failed_data.json", 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-                else:
-                    logger.warning("失敗データファイルの形式が不正です。空のリストを返します。")
-                    return []
-        else:
-            return []
-    except json.JSONDecodeError as e:
-        logger.warning(f"失敗データファイルのJSON解析エラー: {e}。空のリストを返します。")
-        return []
-    except Exception as e:
-        logger.debug(f"失敗データの読み込みエラー: {e}")
-        return []
-
-def clear_failed_data() -> None:
-    """保存された失敗データをクリア"""
-    try:
-        # 通常のパスを試す
-        if os.path.exists(FAILED_DATA_FILE):
-            os.remove(FAILED_DATA_FILE)
-            logger.info("失敗データファイルをクリアしました")
-        # カレントディレクトリも確認
-        elif os.path.exists("sensor_failed_data.json"):
-            os.remove("sensor_failed_data.json")
-            logger.info("失敗データファイルをクリアしました")
-    except Exception as e:
-        logger.warning(f"失敗データファイルのクリアエラー: {e}")
-
-def retry_failed_data(client: InfluxDBClient) -> Tuple[int, int]:
-    """
-    保存された失敗データを再送信
-    戻り値: (成功数, 失敗数)
-    """
-    failed_data = load_failed_data()
-    if not failed_data:
-        return 0, 0
+        sys.exit(1)
     
-    logger.info(f"保存された失敗データを再送信します: {len(failed_data)}エントリ")
+    client = None
+    consecutive_failures = 0
+    max_consecutive_failures = 20  # 連続失敗の許容回数を増やす（WiFi切断時に対応）
     
-    success_count = 0
-    fail_count = 0
+    # 次のロギング時刻を記録（厳密な間隔管理のため）
+    next_log_time = time.time()
     
-    for idx, entry in enumerate(failed_data):
+    while True:
         try:
-            points_data = entry.get("points_data", [])
-            if not points_data:
-                continue
+            cycle_start_time = time.time()
             
-            # バッチで送信（1エントリずつ）
-            if send_to_influxdb(client, points_data):
-                success_count += 1
-                logger.debug(f"再送信成功 ({idx + 1}/{len(failed_data)}): {entry.get('timestamp', 'N/A')}")
+            # ネットワーク接続確認（非ブロッキング的に短時間で確認）
+            network_ok = check_internet_connection()
+            influxdb_reachable = check_influxdb_reachable(INFLUX_CONFIG["host"], INFLUX_CONFIG["port"])
+            
+            if not network_ok or not influxdb_reachable:
+                logger.debug(f"ネットワーク接続不良: internet={network_ok}, influxdb={influxdb_reachable}")
+                # クライアントを無効化
+                client = None
             else:
-                fail_count += 1
-                logger.debug(f"再送信失敗 ({idx + 1}/{len(failed_data)}): {entry.get('timestamp', 'N/A')}")
-                # 失敗した場合は残りのデータを保存して終了
-                remaining_data = failed_data[idx:]
-                try:
-                    file_dir = os.path.dirname(FAILED_DATA_FILE)
-                    if file_dir and not os.path.exists(file_dir):
-                        failed_file = "sensor_failed_data.json"
-                    else:
-                        failed_file = FAILED_DATA_FILE
-                    
-                    with open(failed_file, 'w', encoding='utf-8') as f:
-                        json.dump(remaining_data, f, ensure_ascii=False, indent=2)
-                    logger.info(f"再送信が途中で失敗しました。残り{len(remaining_data)}エントリを保存しました。")
-                except Exception as e:
-                    logger.warning(f"残りデータの保存エラー: {e}")
-                break
-            
-            # 送信間隔を少し空ける（サーバー負荷軽減）
-            time.sleep(0.1)
-            
-        except Exception as e:
-            logger.warning(f"再送信エラー ({idx + 1}/{len(failed_data)}): {e}")
-            fail_count += 1
-            # エラーが発生した場合も残りのデータを保存
-            remaining_data = failed_data[idx:]
-            try:
-                file_dir = os.path.dirname(FAILED_DATA_FILE)
-                if file_dir and not os.path.exists(file_dir):
-                    failed_file = "sensor_failed_data.json"
-                else:
-                    failed_file = FAILED_DATA_FILE
-                
-                with open(failed_file, 'w', encoding='utf-8') as f:
-                    json.dump(remaining_data, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-            break
-    
-    # 全て成功した場合はファイルをクリア
-    if fail_count == 0 and success_count > 0:
-        clear_failed_data()
-        logger.info(f"全ての失敗データの再送信が完了しました: {success_count}エントリ")
-    elif success_count > 0:
-        logger.info(f"失敗データの再送信を完了しました: 成功{success_count}、失敗{fail_count}")
-    
-    return success_count, fail_count
-
-# ── センサー初期化 ──
-try:
-    pms = PMS5003()
-    bme = BME280()
-    ltr = LTR559()
-    noise = Noise()
-    logger.info("センサー初期化成功")
-except Exception as e:
-    logger.error(f"センサー初期化エラー: {e}")
-    logger.error(traceback.format_exc())
-    raise
-
-# ── メインループ ──
-logger.info("センサーロガーを開始します")
-logger.info(f"ロギング間隔: {INTERVAL_SEC}秒")
-logger.info(f"InfluxDB: {INFLUX_CONFIG['host']}:{INFLUX_CONFIG['port']}")
-logger.info(f"データベース: {INFLUX_CONFIG['database']}")
-
-client = None
-next_log_time = time.time()
-
-while True:
-    try:
-        cycle_start_time = time.time()
-        
-        # 接続状態を追跡（復旧検出のため）
-        was_connected = (client is not None)
-        
-        # ネットワーク接続確認
-        influxdb_reachable = check_influxdb_reachable(INFLUX_CONFIG["host"], INFLUX_CONFIG["port"])
-        
-        if not influxdb_reachable:
-            logger.debug("InfluxDBサーバーに到達できません")
-            client = None
-        else:
-            if client is None:
-                logger.debug("InfluxDBクライアントを作成します...")
-                client = create_influxdb_client()
+                # InfluxDBクライアントの確認・作成
                 if client is None:
-                    logger.debug("InfluxDB接続失敗")
-                else:
-                    # 接続が復旧した場合、保存された失敗データを再送信
-                    if not was_connected:
-                        logger.info("InfluxDB接続が復旧しました。保存された失敗データを再送信します...")
-                        retry_success, retry_fail = retry_failed_data(client)
-                        if retry_success > 0:
-                            logger.info(f"再送信完了: 成功{retry_success}、失敗{retry_fail}")
-        
-        # --- BME280：複数回読んで中央値 ---
-        raw_temp = median_read(bme.get_temperature, n=5)
-        hum      = median_read(bme.get_humidity,    n=5)
-        pres     = median_read(bme.get_pressure,    n=5)
-
-        # CPU補正（rawが取れた時だけ）
-        temp = None
-        if raw_temp is not None:
-            temp = compensate_temp(raw_temp, factor=5.0)
-
-        # --- スパイク抑制（1分周期想定の変化量制限） ---
-        temp = sanitize("temperature", temp, min_v=-20, max_v=60, max_step=0.5)
-        hum  = sanitize("humidity", hum,  min_v=0, max_v=100, max_step=3.0)
-        pres = sanitize("pressure", pres, min_v=800, max_v=1100, max_step=1.0)
-
-        # --- ほかのセンサー ---
-        try:
-            gas_data = gas.read_all()
-        except Exception:
-            gas_data = None
-
-        try:
-            pm = pms.read()
-        except Exception:
-            pm = None
-
-        try:
-            lux = float(ltr.get_lux())
-        except Exception:
-            lux = None
-        lux = sanitize("lux", lux, min_v=0, max_v=200000, max_step=100000)
-
-        try:
-            noise_dba = round(noise.get_noise_profile()[3], 1)
-        except Exception:
-            noise_dba = None
-
-        # --- InfluxDB Point 作成（値がNoneのものは送らない） ---
-        points_data = []
-        timestamp = datetime.utcnow().isoformat()
-
-        if temp is not None:
-            points_data.append({
-                "measurement": "temperature",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": round(temp, 2)}
-            })
-        if hum is not None:
-            points_data.append({
-                "measurement": "humidity",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": round(hum, 2)}
-            })
-        if pres is not None:
-            points_data.append({
-                "measurement": "pressure",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": round(pres, 2)}
-            })
-
-        if pm is not None:
-            points_data.append({
-                "measurement": "pm1",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(pm.pm_ug_per_m3(1.0))}
-            })
-            points_data.append({
-                "measurement": "pm2_5",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(pm.pm_ug_per_m3(2.5))}
-            })
-            points_data.append({
-                "measurement": "pm10",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(pm.pm_ug_per_m3(10))}
-            })
-
-        if gas_data is not None:
-            points_data.append({
-                "measurement": "oxidising",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(gas_data.oxidising)}
-            })
-            points_data.append({
-                "measurement": "reducing",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(gas_data.reducing)}
-            })
-            points_data.append({
-                "measurement": "nh3",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(gas_data.nh3)}
-            })
-
-        if lux is not None:
-            points_data.append({
-                "measurement": "lux",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(lux)}
-            })
-
-        if noise_dba is not None:
-            points_data.append({
-                "measurement": "noise_dba",
-                "tags": {"device": HOST_TAG},
-                "time": timestamp,
-                "fields": {"value": float(noise_dba)}
-            })
-
-        # InfluxDBに送信（可能な場合）
-        if points_data and client is not None:
-            elapsed = time.time() - cycle_start_time
-            max_send_time = INTERVAL_SEC - elapsed - 5  # 5秒のマージン
+                    logger.debug("InfluxDBクライアントを作成します...")
+                    client = create_influxdb_client()
+                    if client is None:
+                        logger.debug("InfluxDB接続失敗")
             
-            if max_send_time > 0:
-                success, client = send_with_retry(client, points_data, max_time=max_send_time)
-                if not success:
-                    # 送信失敗時はデータを保存
-                    logger.debug("データ送信失敗。データを保存します。")
-                    save_failed_data(points_data, timestamp)
+            # センサーデータ読み取り（ネットワーク状態に関係なく実行）
+            sensor_data = read_sensor_data()
+            if sensor_data is None:
+                logger.warning("センサーデータの読み取りに失敗しました")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    logger.error("連続失敗回数が上限に達しました。センサーを確認してください。")
+                    consecutive_failures = 0
             else:
-                logger.debug("送信時間が不足しているためスキップ")
-                # 時間不足でもデータは保存
-                save_failed_data(points_data, timestamp)
-        elif points_data:
-            # クライアントが利用できない場合もデータを保存
-            logger.debug("InfluxDBクライアントが利用できないため送信をスキップ。データを保存します。")
-            save_failed_data(points_data, timestamp)
-        
-        # 次のロギング時刻まで正確に待機
-        current_time = time.time()
-        elapsed = current_time - cycle_start_time
-        sleep_time = INTERVAL_SEC - elapsed
-        
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-        else:
-            logger.warning(f"サイクル処理が {abs(sleep_time):.1f}秒 遅延しました")
-        
-        next_log_time = time.time()
-        
-    except KeyboardInterrupt:
-        logger.info("ユーザーによる中断")
-        break
+                # InfluxDBに送信（可能な場合）
+                if client is not None:
+                    # 送信に使える時間を計算（次のサイクルまでに余裕を持たせる）
+                    elapsed = time.time() - cycle_start_time
+                    max_send_time = LOG_INTERVAL - elapsed - 5  # 5秒のマージン
+                    
+                    if max_send_time > 0:
+                        success, client = send_with_retry(client, sensor_data, max_time=max_send_time)
+                        if success:
+                            consecutive_failures = 0
+                        else:
+                            consecutive_failures += 1
+                            logger.debug(f"送信失敗（連続失敗回数: {consecutive_failures}）")
+                    else:
+                        logger.debug("送信時間が不足しているためスキップ")
+                        consecutive_failures += 1
+                else:
+                    logger.debug("InfluxDBクライアントが利用できないため送信をスキップ")
+                    consecutive_failures += 1
+            
+            # 次のロギング時刻まで正確に待機
+            current_time = time.time()
+            elapsed = current_time - cycle_start_time
+            sleep_time = LOG_INTERVAL - elapsed
+            
+            if sleep_time > 0:
+                sleep(sleep_time)
+            else:
+                # 処理に時間がかかりすぎた場合の警告
+                logger.warning(f"サイクル処理が {abs(sleep_time):.1f}秒 遅延しました")
+            
+            # 次のロギング時刻を更新
+            next_log_time = time.time()
+            
+        except KeyboardInterrupt:
+            logger.info("ユーザーによる中断")
+            break
+        except Exception as e:
+            logger.error(f"予期しないエラー: {e}")
+            logger.error(traceback.format_exc())
+            consecutive_failures += 1
+            
+            # エラー後も次のサイクル時刻を保つ
+            current_time = time.time()
+            elapsed = current_time - cycle_start_time
+            sleep_time = LOG_INTERVAL - elapsed
+            
+            if sleep_time > 0:
+                sleep(sleep_time)
+            else:
+                sleep(1)  # 最小待機時間
+
+
+if __name__ == "__main__":
+    try:
+        main_loop()
     except Exception as e:
-        logger.error(f"予期しないエラー: {e}")
-        logger.error(traceback.format_exc())
-        
-        # エラー後も次のサイクル時刻を保つ
-        current_time = time.time()
-        elapsed = current_time - cycle_start_time
-        sleep_time = INTERVAL_SEC - elapsed
-        
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-        else:
-            time.sleep(1)  # 最小待機時間
+        logger.critical(f"致命的なエラー: {e}")
+        logger.critical(traceback.format_exc())
+        sys.exit(1)
 
