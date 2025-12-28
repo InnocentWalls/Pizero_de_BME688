@@ -1,134 +1,217 @@
-Enviro+ & PMS5003 → InfluxDB 2.x Logger
+# Enviro+ センサーロガー
 
-Raspberry Pi + Pimoroni Enviro+ + PMS5003 の環境センサーデータを
-InfluxDB 2.x に定期送信する Python スクリプト。
+Raspberry Pi Zero WとPimoroniのEnviro+を使用して、BME280などのセンサーから気温・湿度・気圧などの環境データを取得し、InfluxDBに送信するプロジェクトです。
 
-温度・湿度のスパイク（瞬間的な異常値）対策を重視した実装。
+## 特徴
 
-特徴
+- **堅牢なネットワーク処理**: WiFi切断やネットワークエラーに強く、自動的に再試行・再接続を行います
+- **データ損失防止**: 送信失敗時にデータをローカルに保存し、接続復旧時に自動的に再送信します
+- **センサーデータの安定化**: 
+  - BME280の読み取りを中央値化してノイズを低減
+  - CPU温度による補正を実装
+  - スパイク（急激な変化）を検出して除外
+- **1分間隔の厳密なロギング**: 処理時間を考慮して正確な間隔を維持
 
-BME280（温度・湿度・気圧）
+## 必要なハードウェア
 
-複数回読み取り → 中央値（median） を使用
+- Raspberry Pi Zero W（または互換ボード）
+- Pimoroni Enviro+ ボード
+- PMS5003 粒子状物質センサー（オプション）
 
-前回値からの 変化量制限（スパイク除外）
+## 必要なソフトウェア
 
-CPU温度を使った ソフトな温度補正
+### Pythonパッケージ
 
-PMS5003
+```bash
+pip install enviroplus pms5003 bme280 ltr559 influxdb
+```
 
-PM1 / PM2.5 / PM10
+### システムパッケージ
 
-MICS6814
+```bash
+sudo apt-get update
+sudo apt-get install python3-pip python3-smbus i2c-tools
+```
 
-酸化 / 還元 / NH3
+## セットアップ
 
-LTR559
+### 1. リポジトリのクローン
 
-照度（lux）
+```bash
+git clone <repository-url>
+cd scd41
+```
 
-ICS-43434
+### 2. 環境変数の設定
 
-簡易 dBA 推定
+`.env.example`を`.env`にコピーして、実際の設定値を入力してください。
 
-InfluxDB 2.x
+```bash
+cp .env.example .env
+nano .env
+```
 
-バッチ書き込み
+### 3. 環境変数の読み込み
 
-自動リトライ（Wi-Fi 瞬断耐性）
+システムの環境変数として設定するか、systemdサービスファイルで設定します。
 
-計測・送信間隔
+#### 方法1: 環境変数として設定
 
-INTERVAL_SEC = 300
+```bash
+export INFLUXDB_HOST=192.168.100.7
+export INFLUXDB_PORT=8086
+export INFLUXDB_USERNAME=grafana
+export INFLUXDB_PASSWORD=grafana
+export INFLUXDB_DATABASE=urban
+export HOST_TAG=pi-living
+```
 
-300秒（5分）間隔
+#### 方法2: systemdサービスファイルで設定
 
-変更する場合はこの値のみ変更
+`/etc/systemd/system/sensor-logger.service`を作成:
 
-※ 間隔を短くする場合（例: 60秒）は
-温度・湿度の max_step（変化量制限）も比例して下げること。
+```ini
+[Unit]
+Description=Enviro+ Sensor Logger
+After=network.target
 
-スパイク対策の考え方
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/scd41
+Environment="INFLUXDB_HOST=192.168.100.7"
+Environment="INFLUXDB_PORT=8086"
+Environment="INFLUXDB_USERNAME=grafana"
+Environment="INFLUXDB_PASSWORD=grafana"
+Environment="INFLUXDB_DATABASE=urban"
+Environment="HOST_TAG=pi-living"
+ExecStart=/usr/bin/python3 /home/pi/scd41/sensor_logger.py
+Restart=always
+RestartSec=10
 
-前提：
+[Install]
+WantedBy=multi-user.target
+```
 
-センサーは たまに1回だけ異常値を返す
+### 4. I2Cの有効化
 
-InfluxDB / Grafana はその1点を線で結ぶ
+```bash
+sudo raspi-config
+# Interface Options > I2C > Enable
+```
 
-→ グラフ上に「針」が出る
+### 5. 実行権限の付与
 
-対策：
+```bash
+chmod +x sensor_logger.py
+```
 
-中央値フィルタ
+### 6. ログディレクトリの作成（必要に応じて）
 
-単発の異常値を除外
+```bash
+sudo mkdir -p /var/log
+sudo chown pi:pi /var/log
+```
 
-変化量制限（max_step）
+## 使用方法
 
-物理的にありえない急変を破棄
+### 手動実行
 
-None / NaN / Inf は送信しない
+```bash
+python3 sensor_logger.py
+```
 
-欠損値として扱う
+### systemdサービスとして実行
 
-デフォルトの変化量制限（5分周期想定）
-センサー	制限
-温度	±1.5 ℃ / 5分
-湿度	±8 %RH / 5分
-気圧	±3 hPa / 5分
+```bash
+# サービスを有効化
+sudo systemctl enable sensor-logger.service
 
-※ 屋外設置・加湿器直下などでは調整が必要。
+# サービスを開始
+sudo systemctl start sensor-logger.service
 
-必要なハードウェア
+# ステータス確認
+sudo systemctl status sensor-logger.service
 
-Raspberry Pi
+# ログ確認
+sudo journalctl -u sensor-logger.service -f
+```
 
-Pimoroni Enviro+
+## 設定項目
 
-PMS5003
+### 必須設定
 
-（任意）Enviro+ Noise（ICS-43434）
+- `INFLUXDB_HOST`: InfluxDBサーバーのホスト名またはIPアドレス
+- `INFLUXDB_PORT`: InfluxDBサーバーのポート番号（デフォルト: 8086）
+- `INFLUXDB_USERNAME`: InfluxDBのユーザー名
+- `INFLUXDB_PASSWORD`: InfluxDBのパスワード
+- `INFLUXDB_DATABASE`: InfluxDBのデータベース名
 
-依存ライブラリ
+### オプション設定
 
-influxdb-client
+- `HOST_TAG`: デバイス識別用のタグ（デフォルト: `raspberry-pi`）
+- `LOG_INTERVAL_SEC`: ロギング間隔（秒）（デフォルト: 60）
+- `MAX_RETRIES`: 最大リトライ回数（デフォルト: 3）
+- `RETRY_DELAY_SEC`: リトライ間隔（秒）（デフォルト: 2）
+- `CONNECTION_TIMEOUT_SEC`: 接続タイムアウト（秒）（デフォルト: 5）
+- `NETWORK_CHECK_TIMEOUT_SEC`: ネットワーク確認タイムアウト（秒）（デフォルト: 2）
+- `FAILED_DATA_FILE`: 失敗データ保存ファイルのパス（デフォルト: `/var/log/sensor_failed_data.json`）
+- `MAX_FAILED_ENTRIES`: 最大保存エントリ数（デフォルト: 1000）
+- `LOG_FILE`: ログファイルのパス（デフォルト: `/var/log/sensor_logger.log`）
+- `LOG_LEVEL`: ログレベル（DEBUG, INFO, WARNING, ERROR）（デフォルト: INFO）
 
-enviroplus
+## 取得されるデータ
 
-pms5003
+以下のセンサーデータがInfluxDBに送信されます:
 
-（Raspberry Pi OS + Enviro+ 環境前提）
+- **temperature**: 気温（℃）- CPU温度で補正済み
+- **humidity**: 湿度（%RH）
+- **pressure**: 気圧（hPa）
+- **pm1, pm2_5, pm10**: 粒子状物質濃度（μg/m³）- PMS5003使用時
+- **oxidising, reducing, nh3**: ガスセンサー値
+- **lux**: 照度（lux）
+- **noise_dba**: 音圧レベル（dBA）
 
-InfluxDB 設定
+## データの保存と復旧
 
-以下を自分の環境に合わせて変更すること。
+送信に失敗したデータは`FAILED_DATA_FILE`で指定されたファイルに保存されます。接続が復旧すると、自動的に保存されたデータが再送信されます。
 
-INFLUX_URL
+失敗データファイルの場所を確認するには:
 
-INFLUX_TOKEN
+```bash
+cat /var/log/sensor_failed_data.json
+```
 
-INFLUX_ORG
+## トラブルシューティング
 
-INFLUX_BUCKET
+### センサーが読み取れない
 
-HOST_TAG
+```bash
+# I2Cデバイスの確認
+sudo i2cdetect -y 1
 
-実行方法
+# ログの確認
+tail -f /var/log/sensor_logger.log
+```
 
-python3 enviro_influx.py
+### InfluxDBに接続できない
 
-常駐運用する場合は systemd または cron を推奨。
+- ネットワーク接続を確認
+- InfluxDBサーバーが起動しているか確認
+- 認証情報が正しいか確認
+- ファイアウォール設定を確認
 
-注意点
+### データが送信されない
 
-このコードは 「グラフを安定させる」ことを優先している
+- ログファイルを確認してエラーメッセージを確認
+- 失敗データファイルにデータが保存されているか確認
+- ネットワーク接続を確認
 
-すべての瞬間値を忠実に記録したい用途には不向き
+## ライセンス
 
-スパイク判定は「時間スケール × 変化量」を前提にしている
+このプロジェクトのライセンス情報を記載してください。
 
-ライセンス
+## 貢献
 
-MIT License
-（Enviro+ / PMS5003 各ライブラリのライセンスはそれぞれに従う）
+プルリクエストやイシューの報告を歓迎します。
+
